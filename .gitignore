@@ -1,0 +1,19 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Diagnostics exported by the app may contain IP addresses
+SplitDirect-诊断-*.zip
