@@ -105,7 +105,7 @@ def base_domain(name):
     return ".".join(parts[-2:])
 
 APP_NAME = "SplitDirect"
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.4"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")

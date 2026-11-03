@@ -20,6 +20,7 @@ import queue
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from collections import namedtuple
@@ -81,6 +82,8 @@ SLOW_CHECK_SECONDS = 30        # 能收到系统的“网络变化”通知时�
 SOCKET_EVENT_FRESH_SECONDS = 3   # TCP 新连接只认这么多秒内的 SOCKET 事件
 FALLBACK_DNS = "223.5.5.5"     # 本地网卡没有 DNS 服务器时用的公共 DNS（阿里）
 MAX_PARENT_LEVELS = 10         # 子进程直连：最多往上找几层父进程
+MATCH_CACHE_SECONDS = 10       # 一个进程“是否直连”的判断结果记住多久（名单、选项一改就清空）
+SLOW_LOOKUP_SECONDS = 0.3      # 新连接排队等判断超过这么久，就在日志里记一条性能记录
 CREATE_NO_WINDOW = 0x08000000  # 运行 PowerShell 时不弹出黑色窗口
 
 DEFAULT_OPTIONS = {
@@ -110,10 +113,16 @@ _PS_SCRIPT = (
     "Select-Object ifIndex, RouteMetric, NextHop; "
     "$d = Get-DnsClientServerAddress -AddressFamily IPv4 | "
     "Select-Object InterfaceIndex, ServerAddresses; "
-    "@{adapters=@($a); addresses=@($i); routes=@($r); dns=@($d)} | ConvertTo-Json -Compress -Depth 4"
+    # 经网关的 /32 主机路由：OpenVPN 连接时会加一条“到 VPN 服务器走本地网关”的路由
+    "$h = Get-NetRoute -AddressFamily IPv4 | Where-Object { $_.DestinationPrefix -like '*/32' "
+    "-and $_.NextHop -ne '0.0.0.0' } | Select-Object ifIndex, DestinationPrefix; "
+    "@{adapters=@($a); addresses=@($i); routes=@($r); dns=@($d); hostroutes=@($h)} "
+    "| ConvertTo-Json -Compress -Depth 4"
 )
 
-Adapters = namedtuple("Adapters", "vpn_ip vpn_index local_ip local_index local_dns vpn_v6 local_v6")
+Adapters = namedtuple("Adapters", "vpn_ip vpn_index local_ip local_index local_dns vpn_v6 local_v6 tunnel_peers")
+Adapters.__new__.__defaults__ = ((),)    # tunnel_peers：VPN 服务器的 IP（隧道本身的加密包来自这些地址）
+MAX_TUNNEL_PEERS = 8
 
 
 def _as_list(x):
@@ -262,8 +271,20 @@ def parse_adapters(data, options=None):
                 local_dns = servers[0]
             break
 
+    # VPN 服务器的地址：经本地网卡网关的 /32 主机路由。隧道的加密包从这些地址发来，抓包时排除掉
+    peers = []
+    for r in _as_list(data.get("hostroutes")):
+        if r.get("ifIndex") != local["index"]:
+            continue
+        ip = str(r.get("DestinationPrefix", "")).split("/")[0]
+        try:
+            if ipaddress.IPv4Address(ip).is_global and ip not in peers:
+                peers.append(ip)
+        except ValueError:
+            pass
     return Adapters(vpn["ip"], vpn["index"], local["ip"], local["index"],
-                    local_dns, vpn["index"] in has_v6, local["index"] in has_v6)
+                    local_dns, vpn["index"] in has_v6, local["index"] in has_v6,
+                    tuple(sorted(peers)[:MAX_TUNNEL_PEERS]))
 
 
 def driver_check():
@@ -297,9 +318,66 @@ def process_owner(pid, cache):
     return cache[pid]
 
 
+# 系统连接表的每一行（GetExtendedTcpTable / GetExtendedUdpTable，带进程号的格式）：
+#   (协议, 地址族, 表格类型, 每行字节数, 本机端口在第几个字节, 进程号在第几个字节)
+_OWNER_TABLES = [
+    ("tcp", 2, 5, 24, 8, 20),      # MIB_TCPROW_OWNER_PID
+    ("tcp6", 23, 5, 56, 20, 52),   # MIB_TCP6ROW_OWNER_PID
+    ("udp", 2, 1, 12, 4, 8),       # MIB_UDPROW_OWNER_PID
+    ("udp6", 23, 1, 28, 20, 24),   # MIB_UDP6ROW_OWNER_PID
+]
+ERROR_INSUFFICIENT_BUFFER = 122
+
+
+def parse_owner_rows(buf, proto, row_size, port_at, pid_at, table):
+    """解析一张连接表（开头 4 字节是行数），结果写进 table：{(协议, 本机端口): 进程号}"""
+    count = int.from_bytes(buf[0:4], "little")
+    count = min(count, (len(buf) - 4) // row_size)
+    view = memoryview(buf)
+    for i in range(count):
+        base = 4 + i * row_size
+        port = int.from_bytes(view[base + port_at:base + port_at + 2], "big")   # 端口按网络字节序存放
+        pid = int.from_bytes(view[base + pid_at:base + pid_at + 4], "little")
+        if port and pid:
+            table[(proto, port)] = pid
+
+
+def _read_owner_table(func, family, table_class):
+    """调用一次系统接口，返回整张表的字节。ctypes 调用期间会释放 Python 的全局锁，抓包线程不受影响"""
+    size = ctypes.c_uint32(0)
+    buf = None
+    for _ in range(5):                                  # 表格在两次调用之间可能变大，多试几次
+        ret = func(buf, ctypes.byref(size), False, family, table_class, 0)
+        if ret == 0:
+            return bytes(buf) if buf is not None else b"\0\0\0\0"
+        if ret != ERROR_INSUFFICIENT_BUFFER:
+            raise OSError(f"读取连接表失败（错误 {ret}）")
+        buf = ctypes.create_string_buffer(size.value + 4096)
+        size = ctypes.c_uint32(len(buf))
+    raise OSError("读取连接表失败（连接数一直在变化）")
+
+
 def port_owner_table():
     """扫描一次系统连接表，返回 {(协议, 本机端口): 进程号}
-    协议是 tcp / udp（IPv4）或 tcp6 / udp6（IPv6）"""
+    协议是 tcp / udp（IPv4）或 tcp6 / udp6（IPv6）。
+    直接调用 Windows 接口：比 psutil 快得多，而且调用期间不占用 Python 的全局锁
+    （psutil 扫描时整个程序都会停住，连接多的时候一次就要上百毫秒，期间所有包都在排队）"""
+    try:
+        iphlpapi = ctypes.windll.iphlpapi
+        funcs = {"tcp": iphlpapi.GetExtendedTcpTable, "udp": iphlpapi.GetExtendedUdpTable}
+    except Exception:
+        funcs = None
+    if funcs is None:
+        return _psutil_owner_table()
+    table = {}
+    for proto, family, table_class, row_size, port_at, pid_at in _OWNER_TABLES:
+        buf = _read_owner_table(funcs[proto[:3]], family, table_class)
+        parse_owner_rows(buf, proto, row_size, port_at, pid_at, table)
+    return table
+
+
+def _psutil_owner_table():
+    """备用：系统接口用不了时，用 psutil 扫描"""
     table = {}
     for conn in psutil.net_connections(kind="inet"):
         if not conn.laddr or not conn.pid:
@@ -409,8 +487,11 @@ class SocketWatcher:
                     proto += "6"
                 key = (proto, sock.LocalPort)
                 if addr.Event == EVENT_SOCKET_CONNECT and addr.Loopback:
-                    # 连接的是本机（127.0.0.1）：常见于把流量交给本机代理软件
-                    if self.on_loopback_connect and sock.RemotePort:
+                    # 连接的是本机（127.0.0.1）：常见于把流量交给本机代理软件。
+                    # 连的是自己开的端口就不算（curl、浏览器等会在本机开一个内部连接给自己用）
+                    owner = self.ports.get((proto, sock.RemotePort))
+                    if self.on_loopback_connect and sock.RemotePort \
+                            and not (owner and owner[0] == sock.ProcessId):
                         self.on_loopback_connect(sock.ProcessId, sock.RemotePort)
                     continue
                 if addr.Event in (EVENT_SOCKET_BIND, EVENT_SOCKET_CONNECT):
@@ -686,6 +767,23 @@ def _new_stats():
             "直连连接": 0, "事件命中": 0, "查询": 0, "查询耗时ms": 0.0, "发送失败": 0, "出错": 0}
 
 
+def _enlarge_queue(w):
+    """加大驱动的排队容量（默认约 4MB）：瞬间来一大批包时先排队，而不是直接丢掉"""
+    try:
+        w.set_param(pydivert.Param.QUEUE_LEN, 8192)
+        w.set_param(pydivert.Param.QUEUE_SIZE, 32 * 1024 * 1024)
+    except Exception:
+        pass
+
+
+MODIFIED = 2       # _handle 的返回值：包被改写过，发送时要重新计算校验和
+
+
+def _new_perf(now, stats):
+    return {"since": now, "batches": 0, "items": 0, "busy": 0.0, "max_wait": 0.0,
+            "scans0": stats["查询"], "scan_ms0": stats["查询耗时ms"]}
+
+
 class _Session:
     """一次抓包会话，对应一组固定的网卡信息。VPN 重连、IP 变化、选项变化时，关掉旧会话、开一个新会话"""
 
@@ -708,6 +806,7 @@ class _Session:
         self.decisions6 = {}          # (协议6, 本机端口) -> [是否拦截, 最后活动时间]
         self.pending = set()          # 正在等后台查询结果的端口
         self.lookup_queue = queue.Queue()
+        self.perf = _new_perf(time.time(), {"查询": 0, "查询耗时ms": 0.0})
         self.stopping = False         # True 表示是我们主动关闭的
         self.done = threading.Event()
         self.capture_threads = []
@@ -731,6 +830,8 @@ class SplitEngine:
         self._generation = 0          # 每次 start() 加 1，用来让旧的监控线程退出
         self._vpn_missing = 0         # 连续几次没找到 VPN 网卡
         self._change_watch = None     # 系统网络变化通知：None 未启动，True 可用，False 不可用
+        self._proc_info = {}          # 进程号 -> (程序名, 路径)，界面显示程序状态用
+        self._match_cache = {}        # 进程号 -> (时间, (是否直连, 名字))
         self.capturing = False        # “查找软件用到的域名”是否在记录
         self.captured = {}            # 记录到的域名 -> [次数, 第一次出现的时间]
 
@@ -742,6 +843,7 @@ class SplitEngine:
         old_apps, old_children = self.apps, self.options["children"]
         self.apps = {a.lower() for a in apps}
         if old_apps != self.apps:
+            self._match_cache = {}
             self._reset_changed(old_apps, old_children)
 
     def set_options(self, **kw):
@@ -754,6 +856,7 @@ class SplitEngine:
         if "local_domains" in changed:
             self._domains = {d.strip().lower().strip(".") for d in self.options["local_domains"] if d.strip()}
         if "children" in changed:
+            self._match_cache = {}
             self._reset_changed(old_apps, old_children)
         if changed & SESSION_OPTIONS and self.running:
             with self._lock:
@@ -779,6 +882,9 @@ class SplitEngine:
         if self.running:
             return
         self.running = True
+        # 抓包线程每处理一个包都要拿一次 Python 的全局锁；默认别的线程最多能占着它 5 毫秒，
+        # 包多的时候会排队变慢。调短到 1 毫秒，让抓包线程更及时地拿到锁
+        sys.setswitchinterval(0.001)
         self._generation += 1                         # 新的一轮：旧的监控线程看到代号变了会自己退出
         self._vpn_missing = 0
         self.stats = _new_stats()
@@ -809,12 +915,19 @@ class SplitEngine:
         返回 {名单项: (正在运行的进程数, 最近 recent_seconds 秒内有流量的直连连接数)}"""
         result = {m: [0, 0] for m in matches}
         cache = {}
-        for p in psutil.process_iter(["name", "exe"]):
-            name = (p.info["name"] or "").lower() or None
-            path = (p.info["exe"] or "").lower() or None
+        # 进程的名字和路径记下来，下次只查新出现的进程（每次都查全部进程的路径比较费时，
+        # 而且会占着 Python 的全局锁，拖慢抓包线程）
+        known, alive = self._proc_info, set()
+        for p in psutil.process_iter():
+            alive.add(p.pid)
+            if p.pid not in known:
+                known[p.pid] = process_owner(p.pid, {})
+            name, path = known[p.pid]
             for m in matches:
                 if entry_matches({m}, name, path):
                     result[m][0] += 1
+        for pid in [pid for pid in known if pid not in alive]:
+            known.pop(pid, None)
         s = self.session
         if s is not None:
             now = time.time()
@@ -832,7 +945,21 @@ class SplitEngine:
     # ---------------- 判断一个进程是否直连 ----------------
 
     def _match(self, pid, cache, apps=None, children=None):
-        """返回 (是否直连, 显示用的名字)。apps / children 不传就用当前设置"""
+        """返回 (是否直连, 显示用的名字)。apps / children 不传就用当前设置。
+        用当前设置判断时，结果按进程记住一会儿：同一个程序同时开几百个连接，只需要查一次进程链"""
+        if apps is None and children is None and pid is not None:
+            hit = self._match_cache.get(pid)
+            now = time.time()
+            if hit is not None and now - hit[0] < MATCH_CACHE_SECONDS:
+                return hit[1]
+            result = self._match_uncached(pid, cache, self.apps, self.options["children"])
+            if len(self._match_cache) > 5000:
+                self._match_cache.clear()
+            self._match_cache[pid] = (now, result)
+            return result
+        return self._match_uncached(pid, cache, apps, children)
+
+    def _match_uncached(self, pid, cache, apps=None, children=None):
         apps = self.apps if apps is None else apps
         children = self.options["children"] if children is None else children
         if pid is None:
@@ -955,10 +1082,13 @@ class SplitEngine:
 
     def _open_session(self, ad):
         s = _Session(ad, self.options)
+        # 发往本地网卡的包里，VPN 隧道自己的加密包占了绝大多数（VPN 下载多快，它就有多少），
+        # 它们和直连程序无关：直接在驱动里排除，不进 Python，VPN 速度不受影响
+        skip = "".join(f" and ip.SrcAddr != {ip}" for ip in ad.tunnel_peers)
         filter4 = (
             f"ip and not loopback and ("
             f"(outbound and ip.SrcAddr == {ad.vpn_ip}) or "
-            f"(inbound and ip.DstAddr == {ad.local_ip}))"
+            f"(inbound and ip.DstAddr == {ad.local_ip}{skip}))"
         )
         # IPv6 只抓发出去的：TCP 只抓建立连接的第一个包，UDP 全抓
         filter6 = "ipv6 and outbound and not loopback and ((tcp and tcp.Syn and not tcp.Ack) or udp)"
@@ -968,6 +1098,9 @@ class SplitEngine:
             if s.v6_mode:
                 s.w6 = pydivert.WinDivert(filter6)
                 s.w6.open()
+            for w in (s.w, s.w6):
+                if w is not None:
+                    _enlarge_queue(w)
         except Exception as e:
             for w in (s.w, s.w6):
                 try:
@@ -978,6 +1111,7 @@ class SplitEngine:
             raise RuntimeError(f"打开 WinDivert 驱动失败：{e}")
 
         self.session = s
+        s.perf = _new_perf(time.time(), self.stats)
         threading.Thread(target=self._lookup_worker, args=(s,), daemon=True).start()
         s.capture_threads = [threading.Thread(target=self._loop, args=(s, s.w, self._handle, s.decisions),
                                               daemon=True)]
@@ -988,7 +1122,8 @@ class SplitEngine:
             t.start()
 
         self.on_log(f"开始分流：VPN 网卡 {ad.vpn_ip}（接口 {ad.vpn_index}），"
-                    f"本地网卡 {ad.local_ip}（接口 {ad.local_index}）")
+                    f"本地网卡 {ad.local_ip}（接口 {ad.local_index}）"
+                    + (f"，VPN 服务器 {'、'.join(ad.tunnel_peers)}" if ad.tunnel_peers else ""))
         s.doh = DohClient(ad.local_ip, self.options["doh"], self._doh_answer, self._doh_failed)
         threading.Thread(target=self._check_dns, args=(s,), daemon=True).start()
         parts = []
@@ -1093,9 +1228,10 @@ class SplitEngine:
             self._last_error_log = now
             self.on_log(f"处理出错：{text}")
 
-    def _send(self, s, w, packet):
+    def _send(self, s, w, packet, recalc=True):
+        """recalc=False：包没改过，不用重新计算校验和（绝大多数包都是这样，省一次计算）"""
         try:
-            if w.send(packet) == 0:
+            if w.send(packet, recalculate_checksum=recalc) == 0:
                 self.stats["发送失败"] += 1
         except Exception as e:
             if not s.stopping:
@@ -1121,7 +1257,8 @@ class SplitEngine:
         self.stats["改写"] += 1
 
     def _handle(self, s, packet):
-        """处理一个 IPv4 包。返回 True 表示已交给后台线程，抓包循环不要再发送它"""
+        """处理一个 IPv4 包。返回 True：已交给后台线程，抓包循环不要再发送它；
+        MODIFIED：改写过，发送时要重新算校验和；False：原样放行"""
         proto = self._proto(packet)
         if proto is None:
             return False
@@ -1144,12 +1281,13 @@ class SplitEngine:
             stale_udp = proto == "udp" and (entry is None or now - entry[1] > UDP_IDLE_SECONDS)
             if new_tcp or stale_udp or key in s.pending:
                 s.pending.add(key)
-                s.lookup_queue.put(("v4", key, packet))
+                s.lookup_queue.put(("v4", key, packet, now))
                 return True
             if entry is not None:
                 if entry[0] and self._try_local_dns(s, packet, force=True):
                     return True                    # 直连程序自己的 DNS 查询：交给国内 DNS
                 self._rewrite_outbound(s, packet, entry)
+                return MODIFIED if entry[0] else False
         else:
             key = (proto, packet.dst_port)
             entry = s.decisions.get(key)
@@ -1160,6 +1298,7 @@ class SplitEngine:
                 packet.dst_addr = s.vpn_ip                 # 目标 IP 换回 VPN 网卡 IP
                 packet.interface = (s.vpn_index, 0)        # 当作从 VPN 网卡收到
                 self.stats["改写"] += 1
+                return MODIFIED
         return False
 
     # ---------------- 本地解析：把 DNS 查询交给国内 DNS（DoH） ----------------
@@ -1215,14 +1354,14 @@ class SplitEngine:
         if s.stopping:
             return
         self._error(f"国内 DNS 查询 {name} 失败（{err}），这次改由 VPN 的 DNS 解析")
-        self._send(s, s.w, query)
+        self._send(s, s.w, query, recalc=False)
 
     # ---------------- IPv6：拦截 ----------------
 
     def _apply6(self, s, packet, block):
         """IPv6 包：要拦截就丢弃（TCP 还要回一个拒绝包）；否则放行"""
         if not block:
-            self._send(s, s.w6, packet)
+            self._send(s, s.w6, packet, recalc=False)
             return
         self.stats["IPv6拦截"] += 1
         if packet.tcp is not None:
@@ -1242,7 +1381,7 @@ class SplitEngine:
         now = time.time()
         if proto == "tcp" or entry is None or now - entry[1] > UDP_IDLE_SECONDS or key in s.pending:
             s.pending.add(key)
-            s.lookup_queue.put(("v6", key, packet))
+            s.lookup_queue.put(("v6", key, packet, now))
             return True
         entry[1] = now
         self._apply6(s, packet, entry[0])
@@ -1270,18 +1409,19 @@ class SplitEngine:
                     self._process_batch(s, batch)
                 except Exception as e:
                     self._error(f"处理新连接出错：{e}")
-                    for family, key, packet in batch:    # 原样放行，至少不会卡住
+                    for family, key, packet, _ in batch:    # 原样放行，至少不会卡住
                         s.pending.discard(key)
-                        self._send(s, s.w if family == "v4" else s.w6, packet)
+                        self._send(s, s.w if family == "v4" else s.w6, packet, recalc=False)
         finally:
             if not s.stopping:                           # 不是正常关闭：让检查线程重启会话
                 s.done.set()
                 self._wake.set()
 
     def _process_batch(self, s, batch):
-        table = self._resolve_owners([key for _, key, _ in batch])
+        start = time.time()
+        table = self._resolve_owners([item[1] for item in batch])
         cache = {}
-        for family, key, packet in batch:
+        for family, key, packet, _ in batch:
             try:
                 if family == "v4":
                     self._decide_v4(s, key, packet, table, cache)
@@ -1290,18 +1430,39 @@ class SplitEngine:
             except Exception as e:
                 self._error(e)
                 s.pending.discard(key)
-                self._send(s, s.w if family == "v4" else s.w6, packet)
+                self._send(s, s.w if family == "v4" else s.w6, packet, recalc=False)
+        self._record_perf(s, batch, start)
+
+    def _record_perf(self, s, batch, start):
+        """记下新连接排队等判断的时间；5 秒内最长的超过 0.3 秒，就在日志里写一条性能记录，方便排查卡顿"""
+        now = time.time()
+        p = s.perf
+        p["batches"] += 1
+        p["items"] += len(batch)
+        p["busy"] += now - start
+        p["max_wait"] = max(p["max_wait"], max(now - item[3] for item in batch))
+        if now - p["since"] < 5:
+            return
+        scans = self.stats["查询"] - p["scans0"]
+        scan_ms = self.stats["查询耗时ms"] - p["scan_ms0"]
+        if p["max_wait"] > SLOW_LOOKUP_SECONDS:
+            self.on_log(
+                f"[性能] 最近 {now - p['since']:.0f} 秒：新连接 {p['items']} 个，分 {p['batches']} 批判断，"
+                f"排队最长 {p['max_wait'] * 1000:.0f}ms，判断共用时 {p['busy'] * 1000:.0f}ms，"
+                f"扫描连接表 {scans} 次" + (f"（平均 {scan_ms / scans:.0f}ms）" if scans else "")
+                + f"，当前还有 {s.lookup_queue.qsize()} 个在排队")
+        s.perf = _new_perf(now, self.stats)
 
     def _resolve_owners(self, keys):
         """为一批端口找到所属进程，返回 {(协议, 端口): 进程号}
-        顺序：① SOCKET 层事件表里“新鲜”的记录 ② 稍等 5 毫秒再查一次（事件可能比数据包晚到）
+        顺序：① SOCKET 层事件表里“新鲜”的记录 ② 稍等 10 毫秒再查一次（事件可能比数据包晚到）
               ③ 扫描系统连接表"""
         keys = set(keys)             # 同一个端口的多个包会一起排队（UDP 连发很常见），只查一次
         sockets = self.sockets
         if sockets is not None and sockets.ok:
             found = self._fresh_owners(sockets.ports, keys)
             if len(found) < len(keys):
-                time.sleep(0.005)
+                time.sleep(0.01)
                 found = self._fresh_owners(sockets.ports, keys)
             if len(found) == len(keys):
                 self.stats["事件命中"] += len(keys)
@@ -1362,7 +1523,7 @@ class SplitEngine:
         if entry[0] and self._try_local_dns(s, packet, force=True):
             return                                 # 直连程序自己的 DNS 查询：交给国内 DNS
         self._rewrite_outbound(s, packet, entry)
-        self._send(s, s.w, packet)
+        self._send(s, s.w, packet, recalc=bool(entry[0]))
 
     def _decide_v6(self, s, key, packet, table, cache):
         entry = s.decisions6.get(key)
@@ -1394,13 +1555,13 @@ class SplitEngine:
                 if len(packet.raw) == 0:      # 关闭后驱动返回空包
                     break
                 self.stats["包"] += 1
-                handled = False
                 try:
                     handled = handler(s, packet)
                 except Exception as e:
                     self._error(e)
-                if not handled:
-                    self._send(s, w, packet)
+                    handled = MODIFIED                # 出错时可能改了一半：按改过处理，重新算校验和
+                if handled is not True:
+                    self._send(s, w, packet, recalc=handled == MODIFIED)
                 count += 1
                 if count % 20000 == 0:
                     now = time.time()
