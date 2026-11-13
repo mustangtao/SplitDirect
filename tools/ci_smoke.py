@@ -12,6 +12,7 @@ import tempfile
 import time
 import types
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")      # CI 的控制台默认编码不认中文
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["APPDATA"] = tempfile.mkdtemp()                       # 不碰真实的配置文件夹
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
