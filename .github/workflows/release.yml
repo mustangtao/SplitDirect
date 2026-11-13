@@ -46,10 +46,8 @@ jobs:
           python -m compileall -q engine.py gui.py preset_updater.py domain_presets.py tools
           python -c "import engine, preset_updater, domain_presets; print('imports ok')"
 
-      # 在真实的 Windows + PySide6 上把窗口建出来、喂几行假数据。
-      # 暂时不阻止发布（continue-on-error）；确认稳定后可以删掉这一行，让它失败时中止打包。
+      # 在真实的 Windows + PySide6 上把窗口建出来、喂几行假数据；失败就不打包
       - name: GUI smoke test
-        continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: python tools/ci_smoke.py
