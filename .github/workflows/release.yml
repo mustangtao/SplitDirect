@@ -1,0 +1,107 @@
+# 自动打包：推送形如 v0.9.5 的 tag 时，在 Windows 上打包、生成 SHA256、创建（或补充）Release。
+# 手动运行（Actions 页面 → Run workflow）只打包并保存为构建产物，不发布。
+# Builds on tag push (v*): packages with PyInstaller, writes a SHA256 file and publishes a release.
+# A manual run only builds and keeps the zip as a workflow artifact.
+name: Build and release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 创建 Release、上传文件需要
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Read version from gui.py
+        id: ver
+        shell: pwsh
+        run: |
+          $line = Select-String -Path gui.py -Pattern '^APP_VERSION = "(.+)"' | Select-Object -First 1
+          if (-not $line) { throw "Cannot find APP_VERSION in gui.py" }
+          $version = $line.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          # 打 tag 发布时，tag 必须和程序里的版本号一致，避免发出名不副实的包
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION $version in gui.py"
+          }
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Import check
+        run: |
+          python -m compileall -q engine.py gui.py preset_updater.py domain_presets.py tools
+          python -c "import engine, preset_updater, domain_presets; print('imports ok')"
+
+      # 在真实的 Windows + PySide6 上把窗口建出来、喂几行假数据。
+      # 暂时不阻止发布（continue-on-error）；确认稳定后可以删掉这一行，让它失败时中止打包。
+      - name: GUI smoke test
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/ci_smoke.py
+
+      # 参数和 build.bat 保持一致
+      - name: Build
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed --uac-admin --icon splitdirect.ico
+          --name SplitDirect --collect-all pydivert --hidden-import psutil._psutil_windows gui.py
+
+      - name: Package and checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $zip = "SplitDirect-$env:VERSION-win64.zip"
+          if (-not (Test-Path dist\SplitDirect\SplitDirect.exe)) { throw "dist\SplitDirect\SplitDirect.exe was not built" }
+          Compress-Archive -Path dist\SplitDirect -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          "ZIP=$zip" >> $env:GITHUB_ENV
+          "HASH=$hash" >> $env:GITHUB_ENV
+          Write-Host "$hash  $zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SplitDirect-win64
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # 已经在网页上建好了 Release：只补上传文件，不动里面写好的说明
+            gh release upload $env:TAG $env:ZIP "$env:ZIP.sha256" --clobber
+          } else {
+            $notes = "release-notes/$env:TAG.md"
+            if (Test-Path $notes) {
+              $body = Get-Content $notes -Raw -Encoding utf8
+            } else {
+              $body = "Windows 64 位：解压后运行 SplitDirect.exe（需要管理员权限）。`nWindows x64: extract the zip and run SplitDirect.exe (administrator rights required)."
+            }
+            $fence = '```'
+            $body += "`n`n**SHA256**`n$fence`n$env:HASH  $env:ZIP`n$fence`n"
+            Set-Content -Path release-body.md -Value $body -Encoding utf8
+            gh release create $env:TAG $env:ZIP "$env:ZIP.sha256" --title "SplitDirect $env:VERSION" --notes-file release-body.md --verify-tag
+          }

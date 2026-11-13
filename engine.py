@@ -17,8 +17,10 @@ import http.client
 import ipaddress
 import json
 import queue
+import re
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -83,6 +85,9 @@ SOCKET_EVENT_FRESH_SECONDS = 3   # TCP 新连接只认这么多秒内的 SOCKET 
 FALLBACK_DNS = "223.5.5.5"     # 本地网卡没有 DNS 服务器时用的公共 DNS（阿里）
 MAX_PARENT_LEVELS = 10         # 子进程直连：最多往上找几层父进程
 MATCH_CACHE_SECONDS = 10       # 一个进程“是否直连”的判断结果记住多久（名单、选项一改就清空）
+MATCH_REFRESH_SECONDS = 5      # 判断结果记了这么久、进程还在开新连接：后台提前刷新，避免到期后新连接要排队
+EVENT_WAIT_SECONDS = 0.01      # SOCKET 事件比数据包晚到时，最多等这么久再去扫连接表
+PROC_SNAPSHOT_SECONDS = 2      # 进程快照（查父进程用）最多沿用这么久
 SLOW_LOOKUP_SECONDS = 0.3      # 新连接排队等判断超过这么久，就在日志里记一条性能记录
 CREATE_NO_WINDOW = 0x08000000  # 运行 PowerShell 时不弹出黑色窗口
 
@@ -318,6 +323,60 @@ def process_owner(pid, cache):
     return cache[pid]
 
 
+class _ProcessEntry32(ctypes.Structure):
+    """PROCESSENTRY32W（64 位下 568 字节）"""
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                ("th32ProcessID", ctypes.c_uint32), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_uint32), ("cntThreads", ctypes.c_uint32),
+                ("th32ParentProcessID", ctypes.c_uint32), ("pcPriClassBase", ctypes.c_int32),
+                ("dwFlags", ctypes.c_uint32), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+_kernel32 = None
+
+
+def process_parent_map():
+    """用一次系统调用读出所有进程的父进程：{进程号: 父进程号}（几毫秒）。读不了返回 None。
+    psutil 查一个进程的父进程要把整张进程表读一遍，沿着进程链往上找几层就是几十毫秒"""
+    global _kernel32
+    try:
+        if _kernel32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)       # 单独加载一份，不改动别人用的函数声明
+            k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+            k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+            for f in (k.Process32FirstW, k.Process32NextW):
+                f.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry32)]
+                f.restype = ctypes.c_int
+            k.CloseHandle.argtypes = [ctypes.c_void_p]
+            k.CloseHandle.restype = ctypes.c_int
+            _kernel32 = k
+        k = _kernel32
+        snap = k.CreateToolhelp32Snapshot(0x2, 0)                    # TH32CS_SNAPPROCESS
+        if not snap or snap == (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1:    # 0 或 INVALID_HANDLE_VALUE
+            return None
+        try:
+            entry = _ProcessEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            result = {}
+            ok = k.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                result[entry.th32ProcessID] = entry.th32ParentProcessID
+                ok = k.Process32NextW(snap, ctypes.byref(entry))
+            return result or None
+        finally:
+            k.CloseHandle(snap)
+    except Exception:
+        return None
+
+
+def process_create_time(pid):
+    """进程创建时间；查不到返回 None（用来确认“父进程”没有被别的进程占用了同一个进程号）"""
+    try:
+        return psutil.Process(pid).create_time()
+    except Exception:
+        return None
+
+
 # 系统连接表的每一行（GetExtendedTcpTable / GetExtendedUdpTable，带进程号的格式）：
 #   (协议, 地址族, 表格类型, 每行字节数, 本机端口在第几个字节, 进程号在第几个字节)
 _OWNER_TABLES = [
@@ -329,37 +388,59 @@ _OWNER_TABLES = [
 ERROR_INSUFFICIENT_BUFFER = 122
 
 
+_ROW_STRUCTS = {}
+
+
+def _row_struct(row_size, port_at, pid_at):
+    """一行里只取“本机端口”和“进程号”两个 4 字节整数，其余字节跳过；用 struct 在 C 里批量解析，比逐行切片快得多"""
+    key = (row_size, port_at, pid_at)
+    st = _ROW_STRUCTS.get(key)
+    if st is None:
+        st = _ROW_STRUCTS[key] = struct.Struct(f"<{port_at}xI{pid_at - port_at - 4}xI{row_size - pid_at - 4}x")
+    return st
+
+
 def parse_owner_rows(buf, proto, row_size, port_at, pid_at, table):
     """解析一张连接表（开头 4 字节是行数），结果写进 table：{(协议, 本机端口): 进程号}"""
     count = int.from_bytes(buf[0:4], "little")
     count = min(count, (len(buf) - 4) // row_size)
-    view = memoryview(buf)
-    for i in range(count):
-        base = 4 + i * row_size
-        port = int.from_bytes(view[base + port_at:base + port_at + 2], "big")   # 端口按网络字节序存放
-        pid = int.from_bytes(view[base + pid_at:base + pid_at + 4], "little")
-        if port and pid:
-            table[(proto, port)] = pid
+    if count <= 0:
+        return
+    rows = _row_struct(row_size, port_at, pid_at).iter_unpack(memoryview(buf)[4:4 + count * row_size])
+    for raw_port, pid in rows:
+        if pid:
+            port = ((raw_port & 0xFF) << 8) | ((raw_port >> 8) & 0xFF)       # 端口按网络字节序存放在低 16 位
+            if port:
+                table[(proto, port)] = pid
+
+
+_TABLE_SIZE_HINT = {}      # (地址族, 表格类型) -> 上次用的缓冲区大小：直接按它分配，省掉一次“问大小”的调用
 
 
 def _read_owner_table(func, family, table_class):
-    """调用一次系统接口，返回整张表的字节。ctypes 调用期间会释放 Python 的全局锁，抓包线程不受影响"""
-    size = ctypes.c_uint32(0)
-    buf = None
+    """调用系统接口，返回整张表的字节。ctypes 调用期间会释放 Python 的全局锁，抓包线程不受影响"""
+    hint_key = (family, table_class)
+    hint = _TABLE_SIZE_HINT.get(hint_key, 0)
+    buf = ctypes.create_string_buffer(hint) if hint else None
+    size = ctypes.c_uint32(hint)
     for _ in range(5):                                  # 表格在两次调用之间可能变大，多试几次
         ret = func(buf, ctypes.byref(size), False, family, table_class, 0)
         if ret == 0:
-            return bytes(buf) if buf is not None else b"\0\0\0\0"
+            if buf is None:
+                return b"\0\0\0\0"
+            _TABLE_SIZE_HINT[hint_key] = len(buf)
+            return ctypes.string_at(buf, min(size.value, len(buf)))
         if ret != ERROR_INSUFFICIENT_BUFFER:
             raise OSError(f"读取连接表失败（错误 {ret}）")
-        buf = ctypes.create_string_buffer(size.value + 4096)
+        buf = ctypes.create_string_buffer(size.value + size.value // 4 + 4096)    # 留出余量：下次连接多一点也不用重来
         size = ctypes.c_uint32(len(buf))
     raise OSError("读取连接表失败（连接数一直在变化）")
 
 
-def port_owner_table():
+def port_owner_table(kinds=None):
     """扫描一次系统连接表，返回 {(协议, 本机端口): 进程号}
-    协议是 tcp / udp（IPv4）或 tcp6 / udp6（IPv6）。
+    协议是 tcp / udp（IPv4）或 tcp6 / udp6（IPv6）。kinds 可以只要 {"udp"} 或 {"tcp"}：
+    只有 UDP 的包要查时不用读又大又慢的 TCP 表。
     直接调用 Windows 接口：比 psutil 快得多，而且调用期间不占用 Python 的全局锁
     （psutil 扫描时整个程序都会停住，连接多的时候一次就要上百毫秒，期间所有包都在排队）"""
     try:
@@ -371,6 +452,8 @@ def port_owner_table():
         return _psutil_owner_table()
     table = {}
     for proto, family, table_class, row_size, port_at, pid_at in _OWNER_TABLES:
+        if kinds is not None and proto[:3] not in kinds:
+            continue
         buf = _read_owner_table(funcs[proto[:3]], family, table_class)
         parse_owner_rows(buf, proto, row_size, port_at, pid_at, table)
     return table
@@ -446,6 +529,16 @@ class SocketWatcher:
         self.ok = True
         threading.Thread(target=self._loop, daemon=True).start()
         return True
+
+    def seed(self):
+        """开始监听之前就已经存在的 UDP socket 没有事件记录（游戏、聊天软件的 UDP 往往开了很久），
+        第一个包来的时候只能去扫连接表。启动时读一次连接表，把它们补进来。
+        只补 UDP：TCP 新连接一定有自己的“发起连接”事件"""
+        try:
+            for key, pid in port_owner_table({"udp"}).items():
+                self.ports.setdefault(key, (pid, 0.0))      # 已经有事件记录的不覆盖
+        except Exception:
+            pass
 
     def stop(self):
         self.stopping = True
@@ -534,6 +627,42 @@ def dns_question(payload):
         return ".".join(labels).lower(), qtype
     except IndexError:
         return None
+
+
+def _skip_dns_name(msg, i):
+    """跳过 DNS 报文里的一个域名（一段段“长度 + 内容”，0 结束；开头两位是 1 的是指向前文的压缩指针），返回后面的位置"""
+    for _ in range(128):
+        n = msg[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+    raise ValueError("域名太长")
+
+
+def dns_addresses(msg):
+    """从 DNS 回包里取出所有 A / AAAA 记录的地址（字符串列表）。格式不对返回已读到的部分"""
+    found = []
+    try:
+        questions, answers = int.from_bytes(msg[4:6], "big"), int.from_bytes(msg[6:8], "big")
+        i = 12
+        for _ in range(questions):
+            i = _skip_dns_name(msg, i) + 4                   # 后面跟着 类型(2) + 类(2)
+        for _ in range(answers):
+            i = _skip_dns_name(msg, i)
+            rtype, rlen = int.from_bytes(msg[i:i + 2], "big"), int.from_bytes(msg[i + 8:i + 10], "big")
+            data = msg[i + 10:i + 10 + rlen]
+            if len(data) != rlen:
+                break
+            if rtype == 1 and rlen == 4:
+                found.append(socket.inet_ntoa(bytes(data)))
+            elif rtype == 28 and rlen == 16:
+                found.append(socket.inet_ntop(socket.AF_INET6, bytes(data)))
+            i += 10 + rlen
+    except (IndexError, ValueError, OSError):
+        pass
+    return found
 
 
 def domain_matches(name, domains):
@@ -764,7 +893,7 @@ def build_rst6(syn):
 
 def _new_stats():
     return {"包": 0, "改写": 0, "本地解析": 0, "IPv6拦截": 0,
-            "直连连接": 0, "事件命中": 0, "查询": 0, "查询耗时ms": 0.0, "发送失败": 0, "出错": 0}
+            "直连连接": 0, "事件命中": 0, "快速判断": 0, "查询": 0, "查询耗时ms": 0.0, "发送失败": 0, "出错": 0}
 
 
 def _enlarge_queue(w):
@@ -781,7 +910,7 @@ MODIFIED = 2       # _handle 的返回值：包被改写过，发送时要重新
 
 def _new_perf(now, stats):
     return {"since": now, "batches": 0, "items": 0, "busy": 0.0, "max_wait": 0.0,
-            "scans0": stats["查询"], "scan_ms0": stats["查询耗时ms"]}
+            "scans0": stats["查询"], "scan_ms0": stats["查询耗时ms"], "fast0": stats.get("快速判断", 0)}
 
 
 class _Session:
@@ -806,7 +935,7 @@ class _Session:
         self.decisions6 = {}          # (协议6, 本机端口) -> [是否拦截, 最后活动时间]
         self.pending = set()          # 正在等后台查询结果的端口
         self.lookup_queue = queue.Queue()
-        self.perf = _new_perf(time.time(), {"查询": 0, "查询耗时ms": 0.0})
+        self.perf = _new_perf(time.time(), {"查询": 0, "查询耗时ms": 0.0, "快速判断": 0})
         self.stopping = False         # True 表示是我们主动关闭的
         self.done = threading.Event()
         self.capture_threads = []
@@ -832,8 +961,13 @@ class SplitEngine:
         self._change_watch = None     # 系统网络变化通知：None 未启动，True 可用，False 不可用
         self._proc_info = {}          # 进程号 -> (程序名, 路径)，界面显示程序状态用
         self._match_cache = {}        # 进程号 -> (时间, (是否直连, 名字))
-        self.capturing = False        # “查找软件用到的域名”是否在记录
+        self._refreshing = set()      # 正在后台刷新判断结果的进程号
+        self._proc_lock = threading.Lock()
+        self._proc_map = (0.0, None)  # 进程快照：(读取时间, {进程号: 父进程号})
+        self._proc_map_ok = True      # 读不了快照（不是 Windows 等）就不再尝试，退回 psutil
+        self.capturing = False       # “查找软件用到的域名”是否在记录
         self.captured = {}            # 记录到的域名 -> [次数, 第一次出现的时间]
+        self._ip_names = {}           # IP -> 域名：国内 DNS 查到过的，连接列表里显示用
 
     # ---------------- 对外接口 ----------------
 
@@ -892,7 +1026,8 @@ class SplitEngine:
         self._wake.clear()
         self._loopback_warned = set()
         self.sockets = SocketWatcher(on_error=self.on_log, on_loopback_connect=self._on_loopback)
-        self.sockets.start()
+        if self.sockets.start():
+            threading.Thread(target=self.sockets.seed, daemon=True).start()     # 补上已经存在的 UDP socket
         self._status("checking", "正在检查网卡……")
         self._start_change_watch()
         threading.Thread(target=self._monitor, args=(self._generation,), daemon=True).start()
@@ -942,6 +1077,69 @@ class SplitEngine:
                         result[m][1] += count
         return {m: tuple(v) for m, v in result.items()}
 
+    def connections(self, recent_seconds=60, limit=2000):
+        """最近 recent_seconds 秒内有流量的连接，给“连接列表”窗口用（会查进程名，放在后台线程里调用）。
+        返回字典列表，最近有流量的在前：
+        proto tcp/udp，family IPv4/IPv6，port 本机端口，dst/dport 目标，pid，name/path 程序，
+        status direct（直连）/ vpn（走 VPN）/ blocked（IPv6 被拦截）/ pass（IPv6 放行），
+        reason 为什么这样处理，domain 目标的域名（国内 DNS 查到过才有），idle 多少秒没有流量"""
+        s = self.session
+        if s is None:
+            return []
+        now = time.time()
+        cache = {}
+        rows = []
+        for family, decisions in (("IPv4", s.decisions), ("IPv6", s.decisions6)):
+            for key, entry in decisions.copy().items():            # 先复制：抓包线程随时会往里加新连接
+                idle = now - entry[1]
+                if len(entry) < 5 or idle > recent_seconds:        # 旧格式（没有目标、进程号）或太久没流量：不显示
+                    continue
+                dst, dport = entry[2]
+                pid = entry[4] if family == "IPv4" else entry[3]
+                direct = entry[0] if family == "IPv4" else entry[4]
+                if family == "IPv4":
+                    status = "direct" if direct else "vpn"
+                else:
+                    status = "blocked" if entry[0] else ("direct" if direct else "pass")
+                rows.append({"proto": key[0][:3], "family": family, "port": key[1], "dst": dst, "dport": dport,
+                             "pid": pid, "status": status, "idle": idle, "direct": bool(direct),
+                             "domain": self._ip_names.get(dst)})
+        rows.sort(key=lambda r: r["idle"])
+        rows = rows[:limit]
+        for r in rows:
+            r["name"], r["path"] = self._proc_name(r["pid"])
+            r["reason"] = self._reason(r, cache)
+        return rows
+
+    def _proc_name(self, pid):
+        if pid is None:
+            return None, None
+        info = self._proc_info.get(pid)
+        if info is None:
+            info = process_owner(pid, {})
+            if info[0] is not None:
+                if len(self._proc_info) > 5000:
+                    self._proc_info.clear()
+                self._proc_info[pid] = info
+        return info
+
+    def _reason(self, row, cache):
+        """用一句话说明这条连接为什么这样处理"""
+        if row["status"] == "blocked":
+            return ("直连程序的 IPv6 连接已拦截，让它改用 IPv4 直连" if row["direct"]
+                    else "VPN 不支持 IPv6，已拦截，让程序改用 IPv4 走 VPN")
+        if row["status"] == "pass":
+            return "IPv6，未处理"
+        if row["pid"] is None:
+            return "查不到连接属于哪个程序" + ("，按直连处理" if row["direct"] else "，走 VPN")
+        direct_now, label = self._match(row["pid"], cache)
+        if direct_now != row["direct"]:
+            return "名单有改动，这条连接保持建立时的处理方式"
+        if not direct_now:
+            return "不在直连名单里，走 VPN"
+        parent = re.search(r"由 (.+?) 启动", label or "")
+        return f"由名单里的 {parent.group(1)} 启动，随它直连" if parent else "在直连名单里"
+
     # ---------------- 判断一个进程是否直连 ----------------
 
     def _match(self, pid, cache, apps=None, children=None):
@@ -968,16 +1166,47 @@ class SplitEngine:
         if entry_matches(apps, name, path):
             return True, path or name
         if children:
-            try:
-                for level, parent in enumerate(psutil.Process(pid).parents()):
-                    if level >= MAX_PARENT_LEVELS:
-                        break
-                    pname, ppath = process_owner(parent.pid, cache)
-                    if entry_matches(apps, pname, ppath):
-                        return True, f"{path or name}（由 {pname} 启动）"
-            except psutil.Error:
-                pass
+            for ppid in self._ancestors(pid):
+                pname, ppath = process_owner(ppid, cache)
+                if entry_matches(apps, pname, ppath):
+                    return True, f"{path or name}（由 {pname} 启动）"
         return False, path or name
+
+    def _ancestors(self, pid):
+        """pid 的各层父进程号，从近到远，最多 MAX_PARENT_LEVELS 层。
+        优先用进程快照（一次系统调用读出全部进程）；读不了就退回 psutil 逐层查"""
+        chain = self._snapshot_ancestors(pid) if self._proc_map_ok else None
+        if chain is not None:
+            return chain
+        try:
+            return [p.pid for _, p in zip(range(MAX_PARENT_LEVELS), psutil.Process(pid).parents())]
+        except psutil.Error:
+            return []
+
+    def _snapshot_ancestors(self, pid):
+        now = time.time()
+        with self._proc_lock:
+            stamp, procs = self._proc_map
+            # 快照太旧，或者里面没有这个进程（刚启动的）：重新读一次；刚读过几毫秒内的不重复读
+            if procs is None or now - stamp > PROC_SNAPSHOT_SECONDS or (pid not in procs and now - stamp > 0.005):
+                procs = process_parent_map()
+                if procs is None:
+                    self._proc_map_ok = False
+                    return None
+                self._proc_map = (now, procs)
+        chain = []
+        child, child_time = pid, process_create_time(pid)
+        while len(chain) < MAX_PARENT_LEVELS:
+            parent = procs.get(child)
+            if not parent or parent == child or parent in chain:
+                break
+            parent_time = process_create_time(parent)
+            # 父进程已经退出、进程号被别的进程占用时，新进程的创建时间会比子进程晚：这不是真的父进程
+            if parent_time is None or (child_time is not None and parent_time > child_time):
+                break
+            chain.append(parent)
+            child, child_time = parent, parent_time
+        return chain
 
     def _on_loopback(self, pid, port):
         """直连程序连接本机端口 → 很可能是把流量交给了本机代理（v2rayN、Clash 等），提醒一次"""
@@ -1280,6 +1509,8 @@ class SplitEngine:
                 new_tcp = False
             stale_udp = proto == "udp" and (entry is None or now - entry[1] > UDP_IDLE_SECONDS)
             if new_tcp or stale_udp or key in s.pending:
+                if key not in s.pending and self._decide_now(s, "v4", key, packet):
+                    return True                    # 进程已经认得：当场判断，不用排队
                 s.pending.add(key)
                 s.lookup_queue.put(("v4", key, packet, now))
                 return True
@@ -1341,12 +1572,23 @@ class SplitEngine:
             if len(answer) > limit:
                 self._doh_failed(OSError(f"回包 {len(answer)} 字节太大"), ctx)
                 return
+            self._remember_names(answer, name)
             answer = payload[:2] + answer[2:]                  # 回包编号必须和查询一致
             raw = build_udp4(query.dst_addr, query.src_addr, 53, query.src_port, answer)
             reply = pydivert.Packet(raw, interface=(s.vpn_index, 0), direction=pydivert.Direction.INBOUND)
             self._send(s, s.w, reply)
         except Exception as e:                                 # 出任何问题：原查询交给 VPN 的 DNS，不让程序干等
             self._doh_failed(e, ctx)
+
+    def _remember_names(self, answer, name):
+        """记下这次查到的 IP 属于哪个域名，连接列表里用来显示“目标是谁”"""
+        try:
+            if len(self._ip_names) > 4000:
+                self._ip_names.clear()
+            for ip in dns_addresses(answer):
+                self._ip_names[ip] = name
+        except Exception:
+            pass
 
     def _doh_failed(self, err, ctx):
         """DoH 查不到：原查询照常发给 VPN 的 DNS，至少还能解析出结果"""
@@ -1380,12 +1622,69 @@ class SplitEngine:
         entry = s.decisions6.get(key)
         now = time.time()
         if proto == "tcp" or entry is None or now - entry[1] > UDP_IDLE_SECONDS or key in s.pending:
+            if key not in s.pending and self._decide_now(s, "v6", key, packet):
+                return True                        # 进程已经认得：当场判断，不用排队
             s.pending.add(key)
             s.lookup_queue.put(("v6", key, packet, now))
             return True
         entry[1] = now
         self._apply6(s, packet, entry[0])
         return True
+
+    # ---------------- 快速判断：进程已经认得，不用排队 ----------------
+
+    def _known_pid(self, key):
+        """端口属于哪个进程，而且这个进程“是否直连”的判断结果还记着：返回进程号，否则返回 None。
+        这时新连接的第一个包可以在抓包线程里当场判断（几十微秒），不用交给后台线程排队"""
+        sockets = self.sockets
+        if sockets is None or not sockets.ok:
+            return None
+        pid = self._fresh_owners(sockets.ports, (key,)).get(key)
+        if pid is None:
+            return None
+        hit = self._match_cache.get(pid)
+        if hit is None:
+            return None
+        age = time.time() - hit[0]
+        if age >= MATCH_CACHE_SECONDS:
+            return None
+        if age > MATCH_REFRESH_SECONDS:
+            self._refresh_soon(pid)                # 快过期了：后台重新判断，下一个新连接也不用等
+        return pid
+
+    def _decide_now(self, s, family, key, packet):
+        """能当场判断就判断并发出这个包，返回 True；否则返回 False（调用者再去排队）"""
+        pid = self._known_pid(key)
+        if pid is None:
+            return False
+        try:
+            if family == "v4":
+                self._decide_v4(s, key, packet, {key: pid}, {})
+            else:
+                self._decide_v6(s, key, packet, {key: pid}, {})
+        except Exception as e:
+            self._error(e)
+            s.pending.discard(key)
+            self._send(s, s.w if family == "v4" else s.w6, packet, recalc=False)   # 出错：原样放行
+        self.stats["快速判断"] += 1
+        return True
+
+    def _refresh_soon(self, pid):
+        if pid in self._refreshing:
+            return
+        self._refreshing.add(pid)
+        threading.Thread(target=self._refresh_pid, args=(pid,), daemon=True).start()
+
+    def _refresh_pid(self, pid):
+        try:
+            apps, children = self.apps, self.options["children"]
+            result = self._match_uncached(pid, {}, apps, children)
+            if apps is self.apps and children == self.options["children"]:      # 计算期间名单没变才采用
+                self._match_cache[pid] = (time.time(), result)
+        except Exception:
+            pass
+        finally:
+            self._refreshing.discard(pid)
 
     # ---------------- 后台查询线程 ----------------
 
@@ -1398,7 +1697,7 @@ class SplitEngine:
                 if item is None:          # 收到结束信号
                     return
                 batch = [item]
-                time.sleep(0.003)
+                time.sleep(0.001)         # 稍等一下，让同时到达的新连接凑成一批，只查一次
                 while not s.lookup_queue.empty():
                     item = s.lookup_queue.get()
                     if item is None:
@@ -1445,12 +1744,13 @@ class SplitEngine:
             return
         scans = self.stats["查询"] - p["scans0"]
         scan_ms = self.stats["查询耗时ms"] - p["scan_ms0"]
+        fast = self.stats["快速判断"] - p["fast0"]
         if p["max_wait"] > SLOW_LOOKUP_SECONDS:
             self.on_log(
-                f"[性能] 最近 {now - p['since']:.0f} 秒：新连接 {p['items']} 个，分 {p['batches']} 批判断，"
+                f"[性能] 最近 {now - p['since']:.0f} 秒：排队判断 {p['items']} 个，分 {p['batches']} 批，"
                 f"排队最长 {p['max_wait'] * 1000:.0f}ms，判断共用时 {p['busy'] * 1000:.0f}ms，"
                 f"扫描连接表 {scans} 次" + (f"（平均 {scan_ms / scans:.0f}ms）" if scans else "")
-                + f"，当前还有 {s.lookup_queue.qsize()} 个在排队")
+                + f"，当场判断 {fast} 个，当前还有 {s.lookup_queue.qsize()} 个在排队")
         s.perf = _new_perf(now, self.stats)
 
     def _resolve_owners(self, keys):
@@ -1461,8 +1761,10 @@ class SplitEngine:
         sockets = self.sockets
         if sockets is not None and sockets.ok:
             found = self._fresh_owners(sockets.ports, keys)
-            if len(found) < len(keys):
-                time.sleep(0.01)
+            # 事件有时比数据包晚到：每 2 毫秒看一次，到了立刻往下走（最多等 EVENT_WAIT_SECONDS），而不是固定睡一觉
+            deadline = time.perf_counter() + EVENT_WAIT_SECONDS
+            while len(found) < len(keys) and time.perf_counter() < deadline:
+                time.sleep(0.002)
                 found = self._fresh_owners(sockets.ports, keys)
             if len(found) == len(keys):
                 self.stats["事件命中"] += len(keys)
@@ -1470,9 +1772,12 @@ class SplitEngine:
         else:
             found = {}
 
+        missing = keys - found.keys()
+        if self.options["verbose"]:
+            self.on_log(f"[扫描连接表] 事件里没有 {len(missing)} 个端口，例如 {sorted(missing)[:3]}")
         start = time.perf_counter()
         try:
-            table = port_owner_table()
+            table = port_owner_table({k[0][:3] for k in missing})     # 只读需要的那种表（TCP / UDP）
         except Exception as e:
             self._error(f"查连接表失败：{e}")
             table = {}
@@ -1532,7 +1837,7 @@ class SplitEngine:
             pid = lookup_pid(table, key)
             direct, label = self._match(pid, cache)
             block = (s.v6_mode == "others" and not direct) or (s.v6_mode == "direct" and direct)
-            entry = [block, time.time()]
+            entry = [block, time.time(), (packet.dst_addr, packet.dst_port), pid, direct]   # 后三项连接列表显示用
             s.decisions6[key] = entry
             s.pending.discard(key)
             if block and direct and first:

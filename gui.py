@@ -29,16 +29,17 @@ import zipfile
 
 import psutil
 from PySide6.QtCore import (
-    QAbstractAnimation, QEasingCurve, QFileInfo, QObject, QPropertyAnimation, QSize, Qt, QTimer, Signal,
+    QAbstractAnimation, QEasingCurve, QFileInfo, QItemSelectionModel, QObject, QPropertyAnimation, QSize, Qt,
+    QTimer, Signal,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFileIconProvider, QFrame, QHBoxLayout,
-    QGridLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QGridLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
     QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QStyle,
-    QSystemTrayIcon, QVBoxLayout, QWidget,
+    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import domain_presets
@@ -105,7 +106,7 @@ def base_domain(name):
     return ".".join(parts[-2:])
 
 APP_NAME = "SplitDirect"
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), APP_NAME)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
@@ -236,6 +237,12 @@ QLineEdit, QComboBox {{ border: 1px solid {c['btn_border']}; border-radius: 6px;
 QPlainTextEdit {{ border: 1px solid {c['border']}; border-radius: 8px; background: {c['input_bg']};
                   font-family: Consolas, "Microsoft YaHei UI"; font-size: 9pt; }}
 QScrollArea {{ background: transparent; }}
+QTableWidget {{ border: 1px solid {c['border']}; border-radius: 8px; background: {c['input_bg']};
+                gridline-color: {c['line']}; outline: none; }}
+QTableWidget::item {{ padding: 2px 6px; }}
+QTableWidget::item:selected {{ background: {c['accent_hover']}; color: {c['text']}; }}
+QHeaderView::section {{ background: {c['card']}; color: {c['sub']}; border: none;
+                        border-bottom: 1px solid {c['border']}; padding: 6px 8px; font-weight: 600; }}
 QMenu {{ background: {c['card']}; border: 1px solid {c['border']}; padding: 4px; }}
 QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {c['accent_hover']}; color: {c['text']}; }}
@@ -710,6 +717,7 @@ class Bridge(QObject):
     network = Signal(object, str)                 # 网卡原始数据（失败时为 None）、出错原因
     activity = Signal(object)                     # 名单里每一项的实时状态
     self_check = Signal(object)                   # 自检结果
+    connections = Signal(object)                  # 连接列表
     export_done = Signal(str, str)                # 导出诊断信息：保存路径、出错原因（成功为空）
 
 
@@ -1494,6 +1502,207 @@ class SelfCheckDialog(QDialog):
 
 
 # ======================================================================
+# 连接列表：实时看每个连接属于哪个程序、走直连还是 VPN
+# ======================================================================
+
+CONN_STATUS = {"direct": "直连", "vpn": "走 VPN", "blocked": "已拦截", "pass": "放行"}
+CONN_FILTERS = [("全部", None), ("只看直连", {"direct"}), ("只看走 VPN", {"vpn"}), ("IPv6 拦截 / 放行", {"blocked", "pass"})]
+CONN_WINDOWS = [("最近 30 秒", 30), ("最近 1 分钟", 60), ("最近 5 分钟", 300)]
+CONN_LIMIT = 500                                      # 表格最多显示多少行（再多刷新会卡）
+
+
+def fmt_target(ip, port):
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def fmt_idle(seconds):
+    s = int(seconds)
+    return "刚刚" if s < 2 else f"{s} 秒前" if s < 60 else f"{s // 60} 分钟前"
+
+
+def filter_connections(rows, statuses, text):
+    """按状态和搜索词筛选。搜索词不分大小写，在程序名、路径、目标地址、域名、原因里找"""
+    text = text.strip().lower()
+    result = []
+    for r in rows:
+        if statuses is not None and r["status"] not in statuses:
+            continue
+        if text:
+            hay = " ".join(str(x) for x in (r["name"], r["path"], fmt_target(r["dst"], r["dport"]),
+                                            r["domain"], r["reason"], r["proto"], CONN_STATUS[r["status"]]) if x)
+            if text not in hay.lower():
+                continue
+        result.append(r)
+    return result
+
+
+def connections_text(rows):
+    """复制到剪贴板的文字：一行一个连接，用制表符分隔（可以直接粘贴进 Excel）"""
+    lines = ["状态\t程序\t协议\t目标\t域名\t原因"]
+    for r in rows:
+        lines.append("\t".join([CONN_STATUS[r["status"]], r["path"] or r["name"] or "未知进程",
+                                f"{r['proto'].upper()} {r['family']}", fmt_target(r["dst"], r["dport"]),
+                                r["domain"] or "", r["reason"]]))
+    return "\n".join(lines)
+
+
+class ConnectionsDialog(QDialog):
+    HEADERS = ["状态", "程序", "协议", "目标", "域名", "原因", "最近流量"]
+
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.rows = []                                # 引擎返回的全部连接
+        self.shown = []                               # 筛选后实际显示的行
+        self.setWindowTitle("连接列表")
+        self.resize(1040, 580)
+
+        self.summary = label("", "sub", wrap=True)
+        self.kind = NoWheelComboBox()
+        for text, statuses in CONN_FILTERS:
+            self.kind.addItem(text, statuses)
+        self.span = NoWheelComboBox()
+        for text, seconds in CONN_WINDOWS:
+            self.span.addItem(text, seconds)
+        self.span.setCurrentIndex(1)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索程序、地址、域名……")
+        self.search.setClearButtonEnabled(True)
+        self.pause = QCheckBox("暂停刷新")
+        self.kind.currentIndexChanged.connect(self.render)
+        self.search.textChanged.connect(self.render)
+        self.span.currentIndexChanged.connect(self.refresh)
+
+        self.table = QTableWidget(0, len(self.HEADERS))
+        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)      # 按像素滚动，比按行跳动平滑
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        header = self.table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setStretchLastSection(False)
+        for col, width in enumerate((72, 170, 100, 200, 190, 300, 80)):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+            self.table.setColumnWidth(col, width)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_menu)
+
+        self.hint = label("只显示经过 SplitDirect 的连接。UDP 连接只显示它发出的第一个目标；"
+                          "域名只有国内 DNS 查询过的才知道。", "hint", wrap=True)
+        copy_btn = QPushButton("复制全部")
+        copy_btn.clicked.connect(lambda: self.copy(self.shown))
+        top = QHBoxLayout()
+        top.addWidget(self.kind)
+        top.addWidget(self.span)
+        top.addWidget(self.search, 1)
+        top.addWidget(self.pause)
+        top.addWidget(copy_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.summary)
+        layout.addLayout(top)
+        layout.addWidget(self.table, 1)
+        layout.addWidget(self.hint)
+
+        main.bridge.connections.connect(self.show_rows)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(2000)
+
+    def tick(self):
+        if self.isVisible() and not self.pause.isChecked():
+            self.refresh()
+
+    def refresh(self):
+        self.main.fetch_connections_async(self.span.currentData())
+
+    def show_rows(self, rows):
+        if self.pause.isChecked():
+            return
+        self.rows = rows
+        self.render()
+
+    def render(self):
+        """按当前的筛选条件把连接画进表格（刷新时保持滚动位置和选中的行）"""
+        scroll = self.table.verticalScrollBar().value()
+        keep = {self.row_key(self.shown[i]) for i in self.selected_rows() if i < len(self.shown)}   # 旧列表里选中的行
+        self.shown = filter_connections(self.rows, self.kind.currentData(), self.search.text())
+        visible = self.shown[:CONN_LIMIT]
+        counts = {k: 0 for k in CONN_STATUS}
+        for r in self.rows:
+            counts[r["status"]] += 1
+
+        self.table.setUpdatesEnabled(False)
+        self.table.clearSelection()
+        self.table.setRowCount(len(visible))
+        colors = {"direct": QColor(GREEN), "blocked": QColor("#e0a200"), "vpn": QColor(COLORS["text"]),
+                  "pass": QColor(COLORS["sub"])}
+        for i, r in enumerate(visible):
+            cells = [CONN_STATUS[r["status"]], r["name"] or "未知进程", f"{r['proto'].upper()} {r['family']}",
+                     fmt_target(r["dst"], r["dport"]), r["domain"] or "", r["reason"], fmt_idle(r["idle"])]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col == 0:
+                    item.setForeground(colors[r["status"]])
+                    f = item.font()
+                    f.setBold(r["status"] != "vpn")
+                    item.setFont(f)
+                elif col in (4, 6):
+                    item.setForeground(QColor(COLORS["sub"]))
+                if col == 1 and r["path"]:
+                    item.setToolTip(r["path"])
+                if col == 5:
+                    item.setToolTip(r["reason"])
+                self.table.setItem(i, col, item)
+            if self.row_key(r) in keep:               # 逐行加入选区（selectRow 会清掉前面选的行）
+                self.table.selectionModel().select(
+                    self.table.model().index(i, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self.table.verticalScrollBar().setValue(scroll)
+        self.table.setUpdatesEnabled(True)
+
+        engine = self.main.engine
+        if not self.rows:
+            self.summary.setText("分流没有运行，所以没有连接记录。点“开始分流”后再来看。" if not engine.running
+                                 else "最近没有经过 SplitDirect 的连接。")
+        else:
+            text = (f"{len(self.rows)} 个连接：直连 {counts['direct']} · 走 VPN {counts['vpn']}"
+                    + (f" · IPv6 拦截 {counts['blocked']}" if counts["blocked"] else ""))
+            if len(self.shown) != len(self.rows):
+                text += f"（筛选后 {len(self.shown)} 个）"
+            if len(self.shown) > CONN_LIMIT:
+                text += f"，只显示最近的 {CONN_LIMIT} 个"
+            self.summary.setText(text)
+
+    @staticmethod
+    def row_key(r):
+        return (r["family"], r["proto"], r["port"])
+
+    def selected_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()})
+
+    def show_menu(self, pos):
+        rows = [self.shown[i] for i in self.selected_rows() if i < len(self.shown)]
+        if not rows:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"复制选中的 {len(rows)} 行", lambda: self.copy(rows))
+        ips = "\n".join(dict.fromkeys(r["dst"] for r in rows))
+        menu.addAction("复制目标 IP", lambda: QApplication.clipboard().setText(ips))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def copy(self, rows):
+        QApplication.clipboard().setText(connections_text(rows))
+        self.summary.setText(self.summary.text().split("（已复制")[0] + f"（已复制 {len(rows)} 行）")
+
+
+# ======================================================================
 # 日志窗口
 # ======================================================================
 
@@ -1623,6 +1832,8 @@ class MainWindow(QWidget):
         self.network_busy = False
         self.self_check_busy = False
         self.self_check_window = None
+        self.connections_window = None
+        self.connections_busy = False
         self.engine = SplitEngine(on_log=self.bridge.log.emit, on_status=self.bridge.status.emit)
         self.engine.set_options(**{k: v for k, v in self.options.items()
                                     if k in DEFAULT_OPTIONS and k != "local_domains"})
@@ -1854,9 +2065,14 @@ class MainWindow(QWidget):
         check.setObjectName("link")
         check.setToolTip("一键检查：管理员权限、驱动、网卡、国内 DNS、系统代理、名单里的程序")
         check.clicked.connect(self.show_self_check)
+        conns = QPushButton("连接")
+        conns.setObjectName("link")
+        conns.setToolTip("实时查看每个连接属于哪个程序，走的是直连还是 VPN，以及为什么")
+        conns.clicked.connect(self.show_connections)
         row = QHBoxLayout()
         row.setContentsMargins(4, 0, 0, 0)
         row.addWidget(self.footer_stats, 1)
+        row.addWidget(conns)
         row.addWidget(check)
         row.addWidget(settings)
         row.addWidget(logs)
@@ -2033,6 +2249,8 @@ class MainWindow(QWidget):
             apply_theme(dark)
             if self.self_check_window is not None and self.self_check_window.results:
                 self.self_check_window.render()       # 自检结果里的颜色跟着主题变
+            if self.connections_window is not None:
+                self.connections_window.render()      # 连接列表里的颜色也跟着变
 
     def set_theme(self, theme):
         self.options["theme"] = theme
@@ -2301,6 +2519,26 @@ class MainWindow(QWidget):
             self.self_check_window = SelfCheckDialog(self)
         self.present(self.self_check_window)
         self.self_check_window.run()
+
+    def show_connections(self):
+        if self.connections_window is None:
+            self.connections_window = ConnectionsDialog(self)
+        self.present(self.connections_window)
+        self.connections_window.refresh()
+
+    def fetch_connections_async(self, seconds):
+        if self.connections_busy:
+            return
+        self.connections_busy = True
+
+        def work():
+            try:
+                rows = self.engine.connections(seconds)
+            except Exception:
+                rows = []
+            self.connections_busy = False
+            self.bridge.connections.emit(rows)
+        threading.Thread(target=work, daemon=True).start()
 
     def run_self_check_async(self):
         if self.self_check_busy:
